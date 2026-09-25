@@ -4,9 +4,9 @@ using OpenTabletDriver.Plugin.Attributes;
 using OpenTabletDriver.Plugin.Output;
 using OpenTabletDriver.Plugin.Tablet;
 
-namespace RawStopAssistV06;
+namespace RawStopAssistV07;
 
-[PluginName("RAW Stop Assist v0.6 · Restart Only")]
+[PluginName("RAW Stop Assist v0.7 · Restart Only")]
 public class RawStopAssistFilter : IPositionedPipelineElement<IDeviceReport>
 {
     private readonly RawStopAssistEngine engine = new();
@@ -23,7 +23,7 @@ public class RawStopAssistFilter : IPositionedPipelineElement<IDeviceReport>
     [Property("Hold time"), Unit("ms"), DefaultPropertyValue(3f)]
     [ToolTip("How long the full Restart dwell is kept after the pen moves off, before the cursor\n" +
              "starts catching up to RAW (0–100 ms).\n\n" +
-             "Counted from the moment the pen leaves the stop point, or from the re-acceleration in flow aim.\n" +
+             "Counted from the moment the pen leaves the stop point.\n" +
              "Recovery never starts before the restart is confirmed (2 reports: ~2 ms at 1000 Hz, ~15 ms at 133 Hz).\n\n" +
              "Hold = Restart dwell: the cursor leaves the circle after ~Restart dwell.\n" +
              "Lower: catch-up starts earlier and feels smoother. Higher: more time on the circle,\n" +
@@ -39,11 +39,13 @@ public class RawStopAssistFilter : IPositionedPipelineElement<IDeviceReport>
     public float RecoverySpeed { get; set; } = 1f;
 
     [Property("Strength"), DefaultPropertyValue(1f)]
-    [ToolTip("How strongly the filter acts around circles (0–2). 0 = pure RAW.\n\n" +
-             "Flow aim: after a jump (peak > 150 mm/s), once the pen drops below Strength × 20% of that peak,\n" +
-             "the cursor slows down more than the pen, then speeds up harder when you re-accelerate.\n" +
-             "Stops: the restart hold builds up at 0.5 × Strength ms per ms of standing still.\n\n" +
-             "Recommended 1–1.5. At 2 the cursor can fully stop just before reaching a circle.")]
+    [ToolTip("How fast the restart delay builds up while you stand still on a circle (0–2). 0 = pure RAW.\n\n" +
+             "Once a real stop is detected, the delay grows by 0.5 × Strength ms per ms of standing still,\n" +
+             "up to Restart dwell. Full delay is ready after about 12 ms + Restart dwell ÷ (0.5 × Strength).\n" +
+             "Higher values give a full hold even after short stops. Slowing down without stopping never\n" +
+             "triggers the filter.\n\n" +
+             "1 = 0.5 ms per ms (the cursor slows gently while the delay builds up).\n" +
+             "2 = 1 ms per ms (the cursor briefly pauses, always within ~0.1–0.25 mm of the pen).")]
     public float Strength { get; set; } = 1f;
 
     [TabletReference]
