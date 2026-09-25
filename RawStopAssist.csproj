@@ -4,9 +4,9 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <AssemblyName>RawStopAssistV06</AssemblyName>
-    <RootNamespace>RawStopAssistV06</RootNamespace>
-    <Version>0.6.0</Version>
+    <AssemblyName>RawStopAssistV07</AssemblyName>
+    <RootNamespace>RawStopAssistV07</RootNamespace>
+    <Version>0.7.0</Version>
     <Product>RawStopAssist</Product>
     <Company>RawStopAssist</Company>
     <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
