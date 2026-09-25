@@ -1,10 +1,10 @@
 using System;
 using System.Numerics;
 
-namespace RawStopAssistV06;
+namespace RawStopAssistV07;
 
 /// <summary>
-/// RAW Stop Assist v0.6 — motore.
+/// RAW Stop Assist v0.7 — motore.
 ///
 /// Idea: l'output è sempre la posizione RAW della penna vista con un ritardo d(t):
 ///     output(t) = P(t − d(t))
@@ -17,10 +17,8 @@ namespace RawStopAssistV06;
 ///  • Quando la penna riparte il cursore è GIÀ in ritardo di Dwell ms: resta sulla
 ///    posizione di stop per Dwell ms dal primo campione di ripartenza, senza bisogno
 ///    di riconoscere la ripartenza in anticipo.
-///  • Flow aim: dopo un movimento veloce (picco > 150 mm/s), se la penna rallenta sotto
-///    20% × Strength del picco senza fermarsi, d cresce a 0.5 × Strength ms per ms (l'output
-///    rallenta più della penna) e alla riaccelerazione torna a 0 con lo stesso recupero
-///    (l'output riaccelera più della penna). Il percorso resta quello esatto della penna.
+///  • I rallentamenti senza stop non attivano nulla: il filtro interviene solo dopo uno stop
+///    riconosciuto (penna ferma entro il raggio del noise per almeno 12 ms).
 ///  • Solo il recupero (d → 0) dipende dalla conferma della ripartenza. Se la conferma
 ///    arriva con un report di ritardo, l'unica conseguenza è che il ritardo di Dwell ms
 ///    dura un report in più; non ci sono mai freeze durante il movimento.
@@ -62,15 +60,7 @@ public sealed class RawStopAssistEngine
     private const double HistoryMarginMs = 25.0;
     private const int HistoryCapacity = 512;
 
-    // Calo di velocità (flow aim)
-    private const float FlowMinPeakMmS = 150f;      // picco minimo perché sia un jump (esclude stream e mira lenta)
-    private const float FlowCutoffPerStrength = 0.2f; // soglia del calo = 20% × Strength del picco recente
-    private const float DipExitHysteresis = 1.15f;  // riaccelerazione: sopra 1.15 × soglia e in aumento
-    private const float PeakDecayMs = 150f;         // memoria del picco di velocità
-    private const double MaxDipMs = 150.0;          // un calo più lungo senza riaccelerare → recupero
-    private const float SpeedSmoothing = 0.5f;      // EMA della velocità per report
-
-    private enum Phase { Raw, Armed, Dip, Recovering }
+    private enum Phase { Raw, Armed, Recovering }
 
     // --- Storico (ring buffer) sulla timeline filtrata ---
     private readonly double[] histT = new double[HistoryCapacity];
@@ -84,14 +74,8 @@ public sealed class RawStopAssistEngine
     private float interval;      // intervallo medio tra report (ms)
     private float lastStep;      // avanzamento dell'ultimo report sulla timeline filtrata (ms)
     private float growRate = GrowRatePerStrength * DefaultStrength;
-    private float strengthNow = DefaultStrength;
     private float recoverySpeedNow = DefaultRecoverySpeed;
     private float holdNow;
-
-    // Velocità della penna (mm/s) e calo
-    private float speed, prevSpeed, peakSpeed;
-    private double dipStart;
-    private float dipCutoff;
 
     // --- Stato ---
     private Phase phase;
@@ -122,7 +106,6 @@ public sealed class RawStopAssistEngine
     /// <summary>Usati dai test/simulazioni.</summary>
     public int ArmCount { get; private set; }
     public int RestartCount { get; private set; }
-    public int DipCount { get; private set; }
     public float CurrentDelayMs => delay;
 
     public void Reset(Vector2 input, double nowMs)
@@ -135,7 +118,6 @@ public sealed class RawStopAssistEngine
         phase = Phase.Raw;
         delay = 0f;
         lastTau = nowMs;
-        speed = prevSpeed = peakSpeed = 0f;
         histStart = 0;
         histCount = 0;
         Push(t, input);
@@ -155,16 +137,16 @@ public sealed class RawStopAssistEngine
         Process(input, nowMs, dwellMs, strength, recoverySpeed, dwellMs);
 
     /// <param name="strength">
-    /// 0–2: quanto il cursore rallenta attorno ai cerchi (flow) e quanto in fretta si prepara il
-    /// trattenimento durante uno stop. 0 = RAW.
+    /// 0–2: velocità con cui il ritardo si prepara durante uno stop riconosciuto
+    /// (0.5 × Strength ms per ms di sosta). 0 = RAW.
     /// </param>
     /// <param name="recoverySpeed">
     /// 0.25–3: velocità del recupero. Durata = 2 × ritardo ÷ recoverySpeed (minimo 2 report);
     /// velocità massima dell'output = (1 + recoverySpeed) × velocità della penna ritardata.
     /// </param>
     /// <param name="holdMs">
-    /// 0–100 ms: per quanto il ritardo resta pieno dopo la ripartenza (dall'ultimo campione fermo
-    /// dopo uno stop, dalla riaccelerazione in flow) prima che parta il recupero.
+    /// 0–100 ms: per quanto il ritardo resta pieno dopo la ripartenza (dall'ultimo campione fermo)
+    /// prima che parta il recupero; mai prima della conferma della ripartenza.
     /// </param>
     public Vector2 Process(Vector2 input, double nowMs, float dwellMs, float strength, float recoverySpeed,
         float holdMs)
@@ -175,8 +157,7 @@ public sealed class RawStopAssistEngine
             : DefaultRecoverySpeed;
         if (!float.IsFinite(strength) || strength <= 0f)
             dwellMs = 0f; // Strength 0: il filtro non si prepara mai → RAW
-        strengthNow = float.IsFinite(strength) ? Math.Clamp(strength, 0f, MaxStrength) : 0f;
-        growRate = GrowRatePerStrength * strengthNow;
+        growRate = float.IsFinite(strength) ? GrowRatePerStrength * Math.Clamp(strength, 0f, MaxStrength) : 0f;
 
         if (!float.IsFinite(input.X) || !float.IsFinite(input.Y) || !double.IsFinite(nowMs))
             return initialized ? Sample(lastTau) : input;
@@ -196,10 +177,8 @@ public sealed class RawStopAssistEngine
             return input;
         }
         lastRawTime = nowMs;
-        Vector2 previous = histP[Index(histCount - 1)];
         AdvanceClock(nowMs, rawDt);
         Push(t, input);
-        UpdateSpeed(input, previous);
 
         float radius = Radius();
         float dist = Vector2.Distance(input, center);
@@ -261,48 +240,9 @@ public sealed class RawStopAssistEngine
                 }
                 break;
 
-            case Phase.Dip:
-                // Il calo può diventare uno stop vero: in quel caso si passa ad Armed tenendo il ritardo.
-                if (inside)
-                {
-                    AddToCluster(input, dist);
-                    if (clusterCount >= 2 && t - clusterStart >= StillConfirmMs)
-                    {
-                        phase = Phase.Armed;
-                        outsideCount = 0;
-                        ArmCount++;
-                        GrowDelay(dwellMs);
-                        break;
-                    }
-                }
-                else
-                {
-                    StartCluster(input);
-                }
-
-                // Durante il calo l'output scorre il percorso a (1 − growRate) della velocità della penna.
-                delay = MathF.Min(dwellMs, delay + growRate * lastStep);
-
-                bool reaccelerating = speed > dipCutoff * DipExitHysteresis && speed > prevSpeed;
-                if (reaccelerating || t - dipStart > MaxDipMs)
-                    BeginRecovery(immediate: true);
-                break;
-
             case Phase.Recovering:
                 UpdateRecovery();
                 break;
-        }
-
-        // Calo di velocità dopo un movimento veloce (flow aim): la penna non si ferma, ma rallenta
-        // sotto FlowCutoffPerStrength × Strength del picco recente e poi riaccelera.
-        if (phase == Phase.Raw && growRate > 0f && peakSpeed >= FlowMinPeakMmS
-            && speed < prevSpeed && speed < FlowCutoffPerStrength * strengthNow * peakSpeed)
-        {
-            phase = Phase.Dip;
-            dipStart = t;
-            dipCutoff = FlowCutoffPerStrength * strengthNow * peakSpeed;
-            DipCount++;
-            delay = MathF.Min(dwellMs, growRate * lastStep);
         }
 
         if (phase == Phase.Raw)
@@ -329,7 +269,7 @@ public sealed class RawStopAssistEngine
             delay = allowed;
     }
 
-    private void BeginRecovery(bool immediate = false)
+    private void BeginRecovery()
     {
         RestartCount++;
         if (delay <= 0.01f)
@@ -341,9 +281,9 @@ public sealed class RawStopAssistEngine
 
         phase = Phase.Recovering;
         recoveryFrom = delay;
-        // Il ritardo resta pieno per Hold ms: dopo uno stop dall'ultimo campione fermo (ma non prima
-        // della conferma della ripartenza), dopo un calo (flow) dalla riaccelerazione.
-        recoveryStart = immediate ? t + holdNow : Math.Max(t, lastInsideTime + holdNow);
+        // Il ritardo resta pieno per Hold ms dall'ultimo campione fermo, ma il recupero non parte
+        // mai prima della conferma della ripartenza (t).
+        recoveryStart = Math.Max(t, lastInsideTime + holdNow);
         recoveryLength = MathF.Max(RecoveryDwellFactor * delay / recoverySpeedNow, RecoveryMinReports * interval);
         UpdateRecovery();
     }
@@ -370,15 +310,6 @@ public sealed class RawStopAssistEngine
             float r = 1f - u;
             delay = recoveryFrom * r * r;
         }
-    }
-
-    // Velocità della penna in mm/s (EMA per report) e picco recente con decadimento esponenziale.
-    private void UpdateSpeed(Vector2 input, Vector2 previous)
-    {
-        float instant = lastStep > 0f ? Vector2.Distance(input, previous) / UnitsPerMm / (lastStep * 0.001f) : speed;
-        prevSpeed = speed;
-        speed += SpeedSmoothing * (instant - speed);
-        peakSpeed = MathF.Max(speed, peakSpeed * MathF.Exp(-lastStep / PeakDecayMs));
     }
 
     private void StartCluster(Vector2 p)
