@@ -4,6 +4,72 @@ using OpenTabletDriver.Plugin.Attributes;
 using OpenTabletDriver.Plugin.Output;
 using OpenTabletDriver.Plugin.Tablet;
 
+namespace RawStopAssistV08;
+
+[PluginName("RAW Stop Assist v0.8 · Micro Restart")]
+public class RawStopAssistFilter : IPositionedPipelineElement<IDeviceReport>
+{
+    private readonly RawStopAssistEngine engine = new();
+    private readonly Stopwatch clock = Stopwatch.StartNew();
+    private readonly object gate = new();
+
+    [Property("Strength"), DefaultPropertyValue(RawStopAssistEngine.DefaultStrength)]
+    [ToolTip("Devocub-style restart strength (0–20). 0 = pure RAW.\n\n" +
+             "The filter acts only when you START moving away from a detected stop.\n" +
+             "Lower values keep a little more low-speed smoothing; higher values become RAW\n" +
+             "more sharply as speed rises. Typical Devocub-like range: about 1–10.\n\n" +
+             "This is intentionally ultra-light: there is no dwell buffer and no continuous smoothing.")]
+    public float Strength { get; set; } = RawStopAssistEngine.DefaultStrength;
+
+    [Property("Hold"), Unit("ms"), DefaultPropertyValue(RawStopAssistEngine.DefaultHoldMs)]
+    [ToolTip("Maximum time the restart-only micro smoothing may exist after leaving a detected stop (0–50 ms).\n\n" +
+             "It is NOT a flat hold: the effect already fades toward RAW with speed and with time.\n" +
+             "There is no Recovery setting and no catch-up phase. 0 = pure RAW.\n" +
+             "For a nearly-RAW feel, start around 2–3 ms.")]
+    public float HoldMilliseconds { get; set; } = RawStopAssistEngine.DefaultHoldMs;
+
+    [TabletReference]
+    public TabletReference Tablet
+    {
+        set
+        {
+            var digitizer = value?.Properties?.Specifications?.Digitizer;
+            if (digitizer != null && digitizer.Width > 0 && digitizer.MaxX > 0)
+            {
+                lock (gate)
+                    engine.UnitsPerMm = digitizer.MaxX / digitizer.Width;
+            }
+        }
+    }
+
+    // Keep the same placement as v0.7: operate on RAW tablet coordinates before screen mapping.
+    public PipelinePosition Position => PipelinePosition.PreTransform;
+
+    public event Action<IDeviceReport> Emit = delegate { };
+
+    public void Consume(IDeviceReport value)
+    {
+        if (value is ITabletReport report)
+        {
+            lock (gate)
+            {
+                report.Position = engine.Process(
+                    report.Position,
+                    clock.Elapsed.TotalMilliseconds,
+                    Math.Clamp(Strength, 0f, RawStopAssistEngine.MaxStrength),
+                    Math.Clamp(HoldMilliseconds, 0f, RawStopAssistEngine.MaxHoldMs));
+            }
+        }
+
+        Emit(value);
+    }
+}
+using System;
+using System.Diagnostics;
+using OpenTabletDriver.Plugin.Attributes;
+using OpenTabletDriver.Plugin.Output;
+using OpenTabletDriver.Plugin.Tablet;
+
 namespace RawStopAssistV07;
 
 [PluginName("RAW Stop Assist v0.7 · Restart Only")]
