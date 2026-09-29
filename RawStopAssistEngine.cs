@@ -1,6 +1,363 @@
 using System;
 using System.Numerics;
 
+namespace RawStopAssistV08;
+
+/// <summary>
+/// RAW Stop Assist v0.8 — restart-only micro smoothing.
+///
+/// Design goals:
+///  • Normal movement is exactly RAW.
+///  • A detected stop only ARMS the filter; standing still never adds delay.
+///  • The effect starts on the first excursion away from an armed stop.
+///  • The assist is a tiny one-report, speed-adaptive blend inspired by Devocub's
+///    documented power-law antichatter behaviour: low speed gets more smoothing,
+///    high speed tends rapidly toward RAW, and higher Strength makes that transition sharper.
+///  • There is no dwell buffer, no positional history playback, and no recovery/catch-up state.
+///  • Hold is only a maximum time window. Inside that window the effect already fades toward RAW
+///    with both speed and time, so ending the window does not require a separate recovery setting.
+///
+/// The output during an assist report is:
+///     output = input - (input - previousRaw) * weight
+///
+/// weight is derived from a maximum internal micro-delay of 0.10 ms, the report interval,
+/// a Devocub-style power curve, and a smooth time envelope. The filter therefore never stores
+/// multi-report positional lag and cannot create the old dwell/recovery catch-up behaviour.
+/// </summary>
+public sealed class RawStopAssistEngine
+{
+    public const float DefaultUnitsPerMm = 100f; // CTL-472: 15200 units / 152 mm
+
+    // --- Stop/restart detector: preserved from v0.7 ---
+    private const float StillRadiusMinMm = 0.08f;
+    private const float StillRadiusMaxMm = 0.25f;
+    private const float NoiseToRadius = 3.5f;
+    private const float ConfirmRadiusFactor = 3f;
+    private const float GrowingStepFactor = 0.25f;
+    private const double GrowWindowMs = 9.0;
+    private const double ResettleMs = 14.0;
+    private const double StillConfirmMs = 12.0;
+    private const double MaxReportGapMs = 60.0;
+
+    // --- User-facing settings ---
+    public const float MaxStrength = 20f;
+    public const float DefaultStrength = 3f;
+    public const float MaxHoldMs = 50f;
+    public const float DefaultHoldMs = 3f;
+
+    // --- Fixed ultra-light assist tuning ---
+    // Hard upper bound on effective positional delay for straight constant-speed motion.
+    // It is normally much lower because the Devocub curve falls rapidly as speed increases.
+    private const float MaxMicroDelayMs = 0.10f;
+
+    // Speed normalization for the Devocub-style power curve:
+    // curve = (1 + speed / scale)^(-Strength)
+    private const float DevocubSpeedScaleMmPerSec = 250f;
+
+    // Additional safety bound: never retain more than 20% of a single RAW report step.
+    private const float MaxBlendFraction = 0.20f;
+
+    private enum Phase { Raw, Armed }
+
+    // --- Timing ---
+    private bool initialized;
+    private double lastRawTime;
+    private double t;
+    private float interval;
+    private float lastStep;
+    private bool intervalReady;
+
+    // --- RAW motion ---
+    private Vector2 previousRaw;
+
+    // --- Stop detector state ---
+    private Phase phase;
+    private Vector2 center;
+    private int clusterCount;
+    private double clusterStart;
+    private int outsideCount;
+
+    private readonly double[] excursionT = new double[256];
+    private readonly float[] excursionD = new float[256];
+    private int excursionCount;
+    private double excursionStart;
+    private float noise;
+
+    // --- Restart-only assist window ---
+    private bool assistActive;
+    private double assistStart;
+
+    public float UnitsPerMm { get; set; } = DefaultUnitsPerMm;
+
+    // Diagnostics for simulations/debugging. They do not affect output.
+    public int ArmCount { get; private set; }
+    public int RestartCount { get; private set; }
+    public float CurrentAssistWeight { get; private set; }
+    public float CurrentEffectiveDelayMs { get; private set; }
+
+    public void Reset(Vector2 input, double nowMs)
+    {
+        initialized = true;
+        lastRawTime = nowMs;
+        t = nowMs;
+        if (!(interval > 0f))
+            interval = 1f;
+        lastStep = interval;
+        intervalReady = false;
+
+        previousRaw = input;
+        phase = Phase.Raw;
+        assistActive = false;
+        CurrentAssistWeight = 0f;
+        CurrentEffectiveDelayMs = 0f;
+
+        StartCluster(input);
+        if (!(noise > 0f))
+            noise = StillRadiusMinMm * UnitsPerMm / NoiseToRadius;
+    }
+
+    /// <summary>
+    /// Process one RAW tablet position.
+    /// Strength follows Devocub-style semantics: lower values keep more low-speed smoothing;
+    /// higher values become RAW more sharply as speed rises. Strength 0 = bypass.
+    /// Hold is the maximum restart-assist window in milliseconds. Hold 0 = bypass.
+    /// </summary>
+    public Vector2 Process(Vector2 input, double nowMs, float strength, float holdMs)
+    {
+        if (!float.IsFinite(input.X) || !float.IsFinite(input.Y) || !double.IsFinite(nowMs))
+            return input;
+
+        strength = float.IsFinite(strength) ? Math.Clamp(strength, 0f, MaxStrength) : 0f;
+        holdMs = float.IsFinite(holdMs) ? Math.Clamp(holdMs, 0f, MaxHoldMs) : 0f;
+
+        // Either zero means true RAW bypass. Reset state so re-enabling starts cleanly.
+        if (strength <= 0f || holdMs <= 0f)
+        {
+            initialized = false;
+            CurrentAssistWeight = 0f;
+            CurrentEffectiveDelayMs = 0f;
+            return input;
+        }
+
+        double rawDt = initialized ? nowMs - lastRawTime : 0.0;
+        if (!initialized || rawDt > MaxReportGapMs || rawDt < 0.0)
+        {
+            Reset(input, nowMs);
+            return input;
+        }
+
+        lastRawTime = nowMs;
+        AdvanceClock(nowMs, rawDt);
+
+        float radius = Radius();
+        float dist = Vector2.Distance(input, center);
+        bool inside = dist <= radius;
+
+        switch (phase)
+        {
+            case Phase.Raw:
+                if (inside)
+                {
+                    AddToCluster(input);
+                    if (clusterCount >= 2 && t - clusterStart >= StillConfirmMs)
+                    {
+                        phase = Phase.Armed;
+                        outsideCount = 0;
+                        ArmCount++;
+                    }
+                }
+                else
+                {
+                    StartCluster(input);
+                }
+                break;
+
+            case Phase.Armed:
+                if (inside)
+                {
+                    // An excursion that came back inside was noise / a tiny correction, not a restart.
+                    if (outsideCount > 0)
+                        CancelAssist();
+
+                    outsideCount = 0;
+                    AddToCluster(input);
+                    noise += 0.05f * (dist - noise);
+                }
+                else
+                {
+                    if (outsideCount == 0)
+                    {
+                        excursionStart = t;
+                        excursionCount = 0;
+                        BeginAssist(); // first actual movement away from an armed stop
+                    }
+
+                    outsideCount++;
+                    RecordExcursion(t, dist);
+
+                    // Same v0.7 restart confirmation logic. It no longer controls when the
+                    // assist begins; it only tells the detector that this was a real departure.
+                    bool far = dist > radius * ConfirmRadiusFactor;
+                    bool growing = OldestInWindow(GrowWindowMs, out float before)
+                        && dist > before + radius * GrowingStepFactor;
+
+                    if (far || growing)
+                    {
+                        RestartCount++;
+                        phase = Phase.Raw;
+                        StartCluster(input);
+                    }
+                    else if (t - excursionStart >= ResettleMs)
+                    {
+                        // Small intentional reposition followed by another stop. Keep the detector
+                        // armed around the new point, but do not carry the previous assist with it.
+                        CancelAssist();
+                        StartCluster(input);
+                    }
+                }
+                break;
+        }
+
+        Vector2 output = ApplyMicroAssist(input, previousRaw, strength, holdMs);
+        previousRaw = input;
+        return output;
+    }
+
+    private void BeginAssist()
+    {
+        assistActive = true;
+        assistStart = t;
+    }
+
+    private void CancelAssist()
+    {
+        assistActive = false;
+        CurrentAssistWeight = 0f;
+        CurrentEffectiveDelayMs = 0f;
+    }
+
+    private Vector2 ApplyMicroAssist(Vector2 input, Vector2 previous, float strength, float holdMs)
+    {
+        CurrentAssistWeight = 0f;
+        CurrentEffectiveDelayMs = 0f;
+
+        if (!assistActive)
+            return input;
+
+        double elapsed = t - assistStart;
+        if (elapsed < 0.0 || elapsed >= holdMs)
+        {
+            assistActive = false;
+            return input;
+        }
+
+        float dt = MathF.Max(lastStep, 0.05f);
+        Vector2 step = input - previous;
+        float stepLength = step.Length();
+        if (!(stepLength > 0f) || !(UnitsPerMm > 0f))
+            return input;
+
+        float speedMmPerSec = stepLength / UnitsPerMm / dt * 1000f;
+        float x = MathF.Max(0f, speedMmPerSec / DevocubSpeedScaleMmPerSec);
+
+        // Devocub-style power law. Equivalent in shape to the documented
+        // (x + OffsetX)^(-Strength) family with fixed OffsetX=1, Multiplier=1, OffsetY=0.
+        // Higher Strength => sharper transition to RAW as speed increases.
+        float speedCurve = MathF.Pow(1f + x, -strength);
+
+        // Hold is a maximum window, not a flat hold. Smoothstep fades the tiny effect to zero
+        // with zero slope at the end, so there is no separate recovery/catch-up phase.
+        float u = Math.Clamp((float)(elapsed / holdMs), 0f, 1f);
+        float smooth = u * u * (3f - 2f * u);
+        float timeEnvelope = 1f - smooth;
+
+        float effectiveDelayMs = MaxMicroDelayMs * speedCurve * timeEnvelope;
+        float weight = Math.Clamp(effectiveDelayMs / dt, 0f, MaxBlendFraction);
+
+        CurrentAssistWeight = weight;
+        CurrentEffectiveDelayMs = weight * dt;
+
+        // One-report fractional delay only. No history buffer and no accumulated lag.
+        return input - step * weight;
+    }
+
+    private void StartCluster(Vector2 p)
+    {
+        center = p;
+        clusterCount = 1;
+        clusterStart = t;
+        outsideCount = 0;
+        excursionCount = 0;
+    }
+
+    private void RecordExcursion(double time, float dist)
+    {
+        if (excursionCount == excursionT.Length)
+        {
+            Array.Copy(excursionT, 1, excursionT, 0, excursionCount - 1);
+            Array.Copy(excursionD, 1, excursionD, 0, excursionCount - 1);
+            excursionCount--;
+        }
+
+        excursionT[excursionCount] = time;
+        excursionD[excursionCount] = dist;
+        excursionCount++;
+    }
+
+    private bool OldestInWindow(double windowMs, out float dist)
+    {
+        for (int i = 0; i < excursionCount - 1; i++)
+        {
+            if (excursionT[i] >= t - windowMs)
+            {
+                dist = excursionD[i];
+                return true;
+            }
+        }
+
+        dist = 0f;
+        return false;
+    }
+
+    private void AddToCluster(Vector2 p)
+    {
+        clusterCount++;
+        center += (p - center) / Math.Min(clusterCount, 16);
+    }
+
+    private float Radius()
+    {
+        float r = noise * NoiseToRadius;
+        return Math.Clamp(r, StillRadiusMinMm * UnitsPerMm, StillRadiusMaxMm * UnitsPerMm);
+    }
+
+    // Preserved v0.7 timing smoother for stop/restart detection only.
+    // It never delays or resamples the cursor position in v0.8.
+    private void AdvanceClock(double nowMs, double rawDt)
+    {
+        if (rawDt >= 0.5 && rawDt <= 40.0)
+        {
+            if (!intervalReady)
+            {
+                interval = (float)rawDt;
+                intervalReady = true;
+            }
+            else
+            {
+                interval += 0.05f * ((float)rawDt - interval);
+            }
+        }
+
+        double predicted = t + interval;
+        double next = predicted + 0.2 * (nowMs - predicted);
+        double clamped = Math.Clamp(next, t + 0.3 * interval, t + 3.0 * interval);
+        lastStep = (float)(clamped - t);
+        t = clamped;
+    }
+}
+using System;
+using System.Numerics;
+
 namespace RawStopAssistV07;
 
 /// <summary>
