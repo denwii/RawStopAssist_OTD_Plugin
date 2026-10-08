@@ -1,5 +1,3 @@
-# RAW Stop Assist v0.9 — Restart Hold
-
 A **restart-only** OpenTabletDriver filter for osu!standard.
 
 Normal aim is exactly RAW. A detected stop only arms the filter. When the pen starts moving away
