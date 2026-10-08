@@ -1,97 +1,85 @@
-# RAW Stop Assist v0.8 — Micro Restart
+# RAW Stop Assist v0.9 — Restart Hold
 
-An ultra-light **restart-only** OpenTabletDriver filter for osu!standard.
+A **restart-only** OpenTabletDriver filter for osu!standard.
 
-v0.8 keeps the stop/restart detector from v0.7, but removes the part that could make the cursor feel
-heavy: there is **no Restart Dwell, no prepared positional delay, no history playback, no Recovery
-Speed, and no catch-up state**.
-
-Normal aim is exactly RAW. A detected stop only arms the filter. The effect begins on the first
-movement away from that stop and is intentionally tiny.
+Normal aim is exactly RAW. A detected stop only arms the filter. When the pen starts moving away
+from that stop, the cursor is held back for **Hold** milliseconds with a firmness set by
+**Strength**, then it catches up and the output is RAW again.
 
 > The filter only sees tablet movement. It does not know where osu! hit circles are or when you click.
 
-## What changed from v0.7
+## What changed from v0.8
 
-Kept:
-- the v0.7 noise-adaptive stop detector;
-- ~12 ms stillness confirmation;
-- the 9 ms restart-growth window and 14 ms resettle logic;
-- tablet-size-aware thresholds in millimetres;
-- the report-timing smoother used by the detector;
-- RAW behaviour during ordinary movement and flow aim.
+v0.8 could not delay the cursor by more than 0.10 ms of movement (a fraction of a pixel), and a
+higher Strength made it weaker. v0.9 replaces that with a real hold:
 
-Removed:
-- Restart Dwell;
-- delay accumulation while stopped;
-- time-shifted trajectory/history playback;
-- Recovery Speed;
-- Hold-as-a-full-delay phase;
-- recovery/catch-up logic.
+- **Strength now means "more"**: higher Strength always holds the cursor more.
+- **Hold is a real duration**: Strength is applied at full value for the whole Hold.
+- the hold uses Devocub's antichatter weighting, so the cursor sticks while the pen is still close
+  and lets go once the pen has pulled away;
+- the stop detector is time-based, so it behaves the same at the tablet's native rate and behind a
+  1000 Hz interpolating filter such as Devocub Antichatter;
+- slow steady motion (slider follow) no longer counts as a stop, and the noise estimate is no longer
+  inflated by slow drift.
 
-Added:
-- a one-report **micro smoothing** that can only start after an armed stop;
-- Devocub-style speed adaptation;
-- only **two settings: Strength and Hold**.
+Still true:
 
-## Devocub-style Strength
+- only **two settings: Strength and Hold**;
+- no dwell buffer, no history playback, no Recovery setting;
+- standing still never adds delay.
 
-Devocub documents its antichatter as a speed-dependent power curve: slower motion gets more
-smoothing and faster motion gets less. Its Strength changes how sharply the curve falls toward RAW.
+## Strength
 
-v0.8 uses the same *idea* only for the tiny restart window, not the full Devocub filter. Internally the
-shape is:
+While the hold lasts, the cursor follows the pen with Devocub's antichatter weight:
 
-`curve = (1 + speed / scale)^(-Strength)`
+`weight = base / (1 + (knee / lag)^3)`, with `knee = Strength × 0.1 mm`
 
-This means:
-- **lower Strength** = the tiny smoothing survives to somewhat higher restart speeds;
-- **higher Strength** = the cursor becomes RAW more sharply as speed rises;
-- **Strength 0** = pure RAW bypass.
+`lag` is the distance between the cursor and the pen. While the pen is closer than the knee the
+cursor barely moves; once the pen is past it, the cursor follows.
 
-Typical Devocub-like values are around **1–10**. Decimals are supported.
+- **Strength 0** = pure RAW bypass;
+- **Strength 10** = knee at 1 mm, the reach of Devocub's own antichatter;
+- **Strength 20** = knee at 2 mm.
 
-Reference: OpenTabletDriver's Devocub port and the original Devocub documentation describe the
-same low-speed-more / high-speed-less power-law concept.
+On a 78 mm wide area mapped to 1920 px, 0.1 mm is about 2.5 px, so each Strength step is roughly
+2.5 px of extra stick.
 
 ## Hold
 
-Hold is only the **maximum window** after the first movement away from a detected stop.
+Hold is how long Strength is applied, counted from the first movement away from the detected stop.
 
-It is not a flat hold. Even before Hold expires, the effect decreases automatically because:
-1. increasing pen speed pushes the Devocub-style curve toward RAW;
-2. a smooth time envelope fades the effect to zero by the end of Hold.
+When Hold ends, the remaining lag collapses in about 2–3 ms and the output is bit-exact RAW again.
+The hold also ends early if the pen comes back to rest.
 
-There is no separate recovery. Once the window ends, output is RAW.
-
-Recommended starting point for a nearly-RAW feel: **Strength 3, Hold 2–3 ms**.
-
-## How light is it?
-
-The runtime effect is deliberately bounded. v0.8 keeps at most **0.10 ms of effective one-report
-positional delay**, and normally much less because the speed curve immediately reduces it as the pen
-accelerates. It also never retains more than 20% of a single RAW report step.
-
-Unlike v0.7, it cannot build several milliseconds of stored lag while you are stopped, because there is
-no delay buffer at all.
+Longer Hold with high Strength means a bigger catch-up at the end, because the cursor has been
+held further behind the pen.
 
 ## Settings
 
 | Setting | Range | Default | Meaning |
 |---|---:|---:|---|
-| **Strength** | 0–20 | 3 | Devocub-style sharpness. Lower = a little smoother; higher = RAW sooner. 0 = RAW |
-| **Hold** | 0–50 ms | 3 ms | Maximum restart-only assist window. 0 = RAW |
+| **Strength** | 0–20 | 5 | How firmly the cursor is held. Higher = more. 0 = RAW |
+| **Hold** | 0–50 ms | 8 ms | How long Strength is applied after leaving a stop. 0 = RAW |
 
 Suggested tests:
-- **3 / 2 ms** — very short, nearly RAW;
-- **3 / 3 ms** — default;
-- **2 / 3 ms** — slightly more persistent at low restart speed;
-- **5 / 3 ms** — sharper / more RAW;
-- **3 / 1 ms** — almost only the first report or two at ~1000 Hz.
+- **5 / 8 ms** — default, light;
+- **10 / 8 ms** — firmer, same duration;
+- **10 / 15 ms** — firm and longer;
+- **20 / 20 ms** — very strong;
+- **5 / 3 ms** — just a short touch.
+
+## When does it trigger?
+
+A stop is confirmed when the pen has stayed within a small radius (0.08–0.25 mm, adapted to the
+pen's jitter) for about 12 ms without drifting. The hold starts on the first report that leaves
+that radius. Flow aim and steady movement never arm the filter.
+
+At the tablet's native report rate (133 Hz on a CTL-472) a report arrives every 7.5 ms, so the hold
+can only act in steps of that size. Behind a 1000 Hz filter it acts every millisecond.
 
 ## Installation
 
-Build the project and place `RawStopAssistV08.dll` in its own OpenTabletDriver plugin folder, or package
+Build the project and place `RawStopAssistV09.dll` in its own OpenTabletDriver plugin folder, or package
 the DLL and this README in a ZIP for the Plugin Manager.
 
 Use only one RAW Stop Assist version at a time.
@@ -106,4 +94,4 @@ dotnet build -c Release
 
 Output:
 
-`bin/Release/net8.0/RawStopAssistV08.dll`
+`bin/Release/net8.0/RawStopAssistV09.dll`
