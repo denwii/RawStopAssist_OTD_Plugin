@@ -3,9 +3,9 @@
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
-    <AssemblyName>RawStopAssistV08</AssemblyName>
-    <RootNamespace>RawStopAssistV08</RootNamespace>
-    <Version>0.8.0</Version>
+    <AssemblyName>RawStopAssistV09</AssemblyName>
+    <RootNamespace>RawStopAssistV09</RootNamespace>
+    <Version>0.9.0</Version>
     <Product>RawStopAssist</Product>
     <Company>RawStopAssist</Company>
     <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
@@ -14,35 +14,4 @@
   <ItemGroup>
     <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.4" ExcludeAssets="runtime" />
   </ItemGroup>
-</Project>
-<Project Sdk="Microsoft.NET.Sdk">
-
-  <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
-    <AssemblyName>RawStopAssistV07</AssemblyName>
-    <RootNamespace>RawStopAssistV07</RootNamespace>
-    <Version>0.7.0</Version>
-    <Product>RawStopAssist</Product>
-    <Company>RawStopAssist</Company>
-    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
-  </PropertyGroup>
-
-  <ItemGroup>
-    <!-- L'originale era compilato contro OpenTabletDriver.Plugin 0.6.7.0.
-         ExcludeAssets=runtime: la DLL del plugin la fornisce OTD a runtime, non va copiata nell'output. -->
-    <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.4" ExcludeAssets="runtime" />
-  </ItemGroup>
-
-  <!-- In alternativa, se il pacchetto NuGet non va bene, referenzia direttamente la DLL
-       della tua installazione di OpenTabletDriver:
-  <ItemGroup>
-    <Reference Include="OpenTabletDriver.Plugin">
-      <HintPath>PERCORSO\OpenTabletDriver\OpenTabletDriver.Plugin.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-  </ItemGroup>
-  -->
-
 </Project>
