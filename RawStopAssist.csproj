@@ -15,3 +15,4 @@
     <PackageReference Include="OpenTabletDriver.Plugin" Version="0.6.4" ExcludeAssets="runtime" />
   </ItemGroup>
 </Project>
+
